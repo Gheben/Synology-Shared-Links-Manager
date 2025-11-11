@@ -1,0 +1,7 @@
+{
+    "hostname": "your-synology-server.com",
+    "port": 22,
+    "username": "admin",
+    "password": "your-password",
+    "BASE_URL": "https://your-server.com/sharing/"
+}
