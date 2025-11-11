@@ -1,0 +1,16 @@
+altgraph==0.17.4
+bcrypt==5.0.0
+cffi==2.0.0
+cryptography==46.0.3
+invoke==2.2.1
+packaging==25.0
+paramiko==4.0.0
+pefile==2023.2.7
+pillow==11.3.0
+pycparser==2.23
+pyinstaller==6.16.0
+pyinstaller-hooks-contrib==2025.9
+PyNaCl==1.6.0
+pywin32-ctypes==0.2.3
+setuptools==80.9.0
+ttkbootstrap==1.16.0
