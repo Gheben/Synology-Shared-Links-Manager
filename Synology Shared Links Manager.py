@@ -3,6 +3,8 @@ import json
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, Listbox, MULTIPLE
 import os
+import shlex
+import uuid
 from tkinter.font import Font
 import webbrowser
 import sys
@@ -31,9 +33,27 @@ def load_config():
         port = config.get('port', 22)
         username = config.get('username', "admin")
         password = config.get('password', "password")
-        base_url = config.get('BASE_URL', "https://server02.it/sharing/")
+        base_url = config.get(
+            'BASE_URL',
+            config.get('base_url', "https://server02.it/sharing/")
+        )
+        backup_directory = config.get(
+            'backup_dir',
+            "/var/services/homes/admin/sslm-backups"
+        )
+        backup_retention_days = int(config.get('backup_retention_days', 7))
+        if not backup_directory or backup_retention_days <= 0:
+            raise ValueError("Configurazione backup non valida.")
         
-        return hostname, port, username, password, base_url
+        return (
+            hostname,
+            port,
+            username,
+            password,
+            base_url,
+            backup_directory,
+            backup_retention_days
+        )
         
     except FileNotFoundError:
         messagebox.showerror(
@@ -56,10 +76,18 @@ def load_config():
         sys.exit(1)
 
 # Carica la configurazione
-hostname, port, username, password, BASE_URL = load_config()
+(
+    hostname,
+    port,
+    username,
+    password,
+    BASE_URL,
+    BACKUP_DIRECTORY,
+    BACKUP_RETENTION_DAYS
+) = load_config()
 
 # Comando base sqlite (rimane invariato)
-sqlite_cmd = 'sqlite3 /usr/syno/etc/private/session/sharing/sharing.db "SELECT rowid, data FROM entry;"'
+sqlite_cmd = 'sqlite3 /usr/syno/etc/private/session/sharing/sharing.db "SELECT rowid, owner_uid, data FROM entry;"'
 command_sqlite = f"sudo -S {sqlite_cmd}"
 
 # Dizionari per la mappatura ID -> nome
@@ -83,7 +111,15 @@ class ModernSSLM:
         self.current_records = []
         
         # Carica configurazione
-        self.hostname, self.port, self.username, self.password, self.BASE_URL = load_config()
+        (
+            self.hostname,
+            self.port,
+            self.username,
+            self.password,
+            self.BASE_URL,
+            self.backup_directory,
+            self.backup_retention_days
+        ) = load_config()
         
         self.setup_ui()
         
@@ -200,12 +236,20 @@ class ModernSSLM:
             bootstyle="danger-outline",
             width=18
         ).pack(side=LEFT, padx=2)
+
+        tb.Button(
+            actions_frame,
+            text="Gestione Backup",
+            command=self.manage_backups,
+            bootstyle="info-outline",
+            width=17
+        ).pack(side=LEFT, padx=2)
         
         # Tabella risultati
         table_frame = tb.Frame(left_panel)
         table_frame.pack(fill=BOTH, expand=True)
         
-        columns = ("rowid", "name", "path", "protect_gids", "protect_uids")
+        columns = ("rowid", "owner", "name", "path", "protect_gids", "protect_uids")
         self.tree = ttk.Treeview(
             table_frame, 
             columns=columns, 
@@ -217,6 +261,7 @@ class ModernSSLM:
         # Configurazione colonne
         for col, text, w in [
             ("rowid", "RowID", 50),
+            ("owner", "Owner", 190),
             ("name", "Nome", 200),
             ("path", "Percorso", 300),
             ("protect_gids", "Gruppi", 200),
@@ -293,6 +338,23 @@ class ModernSSLM:
             bootstyle="primary",
             width=15
         ).pack(side=RIGHT, padx=5)
+
+        # Owner
+        owner_frame = tb.Frame(quick_assign_frame)
+        owner_frame.pack(fill=X, pady=5)
+
+        tb.Label(owner_frame, text="Owner:", bootstyle="dark", width=10).pack(side=LEFT)
+        self.owner_entry = tb.Entry(owner_frame, bootstyle="warning")
+        self.owner_entry.pack(side=LEFT, fill=X, expand=True, padx=(0, 10))
+        self.owner_entry.bind('<Return>', lambda e: self.assign_owner_from_entry())
+
+        tb.Button(
+            owner_frame,
+            text="Cambia Owner",
+            command=self.assign_owner_from_entry,
+            bootstyle="warning",
+            width=15
+        ).pack(side=RIGHT, padx=5)
         
         # Frame informazioni selezionate
         self.selected_info_frame = tb.Labelframe(
@@ -363,12 +425,44 @@ class ModernSSLM:
         
         if len(found_users) > 1:
             # Se ci sono più utenti, chiedi all'utente di scegliere
-            self.show_user_selection(found_users, user_name)
+            self.show_user_selection(
+                found_users,
+                user_name,
+                callback=self.update_with_user,
+                entry=self.user_entry
+            )
         else:
             # Assegna direttamente l'utente trovato
             uid, name = found_users[0]
             self.update_with_user(uid, name)
             self.user_entry.delete(0, tk.END)
+
+    def assign_owner_from_entry(self):
+        """Cerca e seleziona il nuovo owner per i record selezionati."""
+        owner_name = self.owner_entry.get().strip()
+        if not owner_name:
+            messagebox.showwarning("Attenzione", "Inserisci un nome owner.")
+            return
+
+        found_users = self.find_users_by_name(owner_name)
+        if not found_users:
+            messagebox.showwarning(
+                "Attenzione",
+                f"Nessun utente trovato con nome: {owner_name}"
+            )
+            return
+
+        if len(found_users) > 1:
+            self.show_user_selection(
+                found_users,
+                owner_name,
+                callback=self.update_with_owner,
+                entry=self.owner_entry
+            )
+        else:
+            uid, name = found_users[0]
+            self.update_with_owner(uid, name)
+            self.owner_entry.delete(0, tk.END)
     
     def find_groups_by_name(self, group_name):
         """Cerca gruppi per nome"""
@@ -382,7 +476,11 @@ class ModernSSLM:
         # Se non trovato, cerca sul server
         if not found_groups:
             try:
-                cmd = f"sudo -S grep -r -i \"nss_name=.*{group_name}.*\" /usr/syno/etc/private/@accountcache/gid/ 2>/dev/null"
+                cmd = (
+                    "sudo -S grep -r -i -F -- "
+                    f"{shlex.quote(group_name)} "
+                    "/usr/syno/etc/private/@accountcache/gid/ 2>/dev/null"
+                )
                 result = self.run_ssh_command(cmd)
                 group_files = result.splitlines()
                 
@@ -415,16 +513,22 @@ class ModernSSLM:
     def find_users_by_name(self, user_name):
         """Cerca utenti per nome"""
         found_users = []
+        found_uids = set()
         
         # Prima cerca nella mappa esistente
         for uid, name in user_map.items():
-            if user_name.lower() in name.lower():
+            if user_name.lower() in name.lower() and uid not in found_uids:
                 found_users.append((uid, name))
+                found_uids.add(uid)
         
         # Se non trovato, cerca sul server
         if not found_users:
             try:
-                cmd = f"sudo -S grep -r -i \"nss_name=.*{user_name}.*\" /usr/syno/etc/private/@accountcache/uid/ 2>/dev/null"
+                cmd = (
+                    "sudo -S grep -r -i -F -- "
+                    f"{shlex.quote(user_name)} "
+                    "/usr/syno/etc/private/@accountcache/uid/ 2>/dev/null"
+                )
                 result = self.run_ssh_command(cmd)
                 user_files = result.splitlines()
                 
@@ -441,13 +545,12 @@ class ModernSSLM:
                         for file_line in file_content.splitlines():
                             if file_line.startswith("nss_name="):
                                 nss_value = file_line.split("=", 1)[1].strip()
-                                if "\\" in nss_value:
-                                    display_name = nss_value.split("\\", 1)[1]
-                                else:
-                                    display_name = nss_value
+                                display_name = nss_value
                                 break
                         
-                        found_users.append((uid, display_name))
+                        if uid not in found_uids:
+                            found_users.append((uid, display_name))
+                            found_uids.add(uid)
                         user_map[uid] = display_name
             except Exception as e:
                 self.log_message(f"Errore nella ricerca utenti: {e}")
@@ -498,7 +601,7 @@ class ModernSSLM:
         tb.Button(btn_frame, text="Annulla", command=popup.destroy,
                   bootstyle="secondary", width=10).pack(side=LEFT, padx=5)
     
-    def show_user_selection(self, users, search_name):
+    def show_user_selection(self, users, search_name, callback, entry):
         """Mostra selezione quando ci sono più utenti"""
         popup = tb.Toplevel(self.root)
         popup.title("Seleziona Utente")
@@ -531,8 +634,8 @@ class ModernSSLM:
             selected_index = selection[0]
             uid, name = users[selected_index]
             popup.destroy()
-            self.update_with_user(uid, name)
-            self.user_entry.delete(0, tk.END)
+            callback(uid, name)
+            entry.delete(0, tk.END)
 
         btn_frame = tb.Frame(main_frame)
         btn_frame.pack(fill=X, pady=(10, 0))
@@ -709,7 +812,10 @@ class ModernSSLM:
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(self.hostname, self.port, self.username, self.password)
 
-        stdin, stdout, stderr = ssh.exec_command(command, get_pty=True)
+        # Sopprime il prompt sudo e disabilita il PTY: con il PTY attivo il
+        # terminale può riecheggiare la password dentro stdout e nei log.
+        command = command.replace("sudo -S", "sudo -S -p ''")
+        stdin, stdout, stderr = ssh.exec_command(command, get_pty=False)
         stdin.write(self.password + "\n")
         stdin.flush()
 
@@ -724,6 +830,14 @@ class ModernSSLM:
             result = result_bytes.decode('utf-8').strip()
         except UnicodeDecodeError:
             result = result_bytes.decode('utf-8', errors='replace').strip()
+
+        # Compatibilità con eventuali prompt restituiti da comandi remoti
+        # precedenti o da una configurazione sudo non silenziosa.
+        result = "\n".join(
+            line for line in result.splitlines()
+            if line.strip() != "Password:"
+            and not line.strip().lower().startswith("[sudo] password")
+        ).strip()
         
         try:
             error = error_bytes.decode('utf-8').strip()
@@ -778,10 +892,9 @@ class ModernSSLM:
             for line in file_content.splitlines():
                 if line.startswith("nss_name="):
                     nss_value = line.split("=", 1)[1].strip()
-                    if "\\" in nss_value:
-                        user_name = nss_value.split("\\", 1)[1]
-                    else:
-                        user_name = nss_value
+                    # Mantieni il dominio per distinguere account locali e
+                    # account omonimi provenienti da domini diversi.
+                    user_name = nss_value
                     # Aggiungi alla mappa per uso futuro
                     user_map[uid] = user_name
                     return user_name
@@ -806,6 +919,464 @@ class ModernSSLM:
         except Exception as e:
             self.log_message(f"Errore nel recupero owner_uid per rowid {rowid}: {e}")
         return None
+
+    def create_sharing_backup(self, metadata):
+        """Crea un backup SQLite verificato e conserva il relativo manifest."""
+        backup_id = uuid.uuid4().hex[:8]
+        metadata_json = json.dumps(metadata, ensure_ascii=True, separators=(",", ":"))
+        backup_script = (
+            f"backup_dir={shlex.quote(self.backup_directory)}; "
+            "mkdir -p \"$backup_dir\" && "
+            f"backup_path=\"$backup_dir/sharing.db.sslm-$(date +%Y%m%d-%H%M%S)-{backup_id}.db\"; "
+            "sqlite3 /usr/syno/etc/private/session/sharing/sharing.db "
+            "\".backup '$backup_path'\" && "
+            "integrity=$(sqlite3 \"$backup_path\" 'PRAGMA integrity_check;'); "
+            "if [ \"$integrity\" != \"ok\" ]; then "
+            "printf '%s' \"$integrity\"; exit 1; fi; "
+            "manifest_path=\"${backup_path%.db}.json\"; "
+            f"printf '%s' {shlex.quote(metadata_json)} > \"$manifest_path\" && "
+            f"find \"$backup_dir\" -type f "
+            f"\\( -name 'sharing.db.sslm-*.db' -o -name 'sharing.db.sslm-*.json' \\) "
+            f"-mtime +{self.backup_retention_days} -delete && "
+            "printf '%s' \"$backup_path\""
+        )
+        command = f"sudo -S sh -c {shlex.quote(backup_script)}"
+        backup_path = self.run_ssh_command(command)
+        if not backup_path:
+            raise RuntimeError("Il backup di sharing.db non ha restituito un percorso.")
+        return backup_path
+
+    def update_with_owner(self, owner_uid, owner_name):
+        """Cambia l'owner dei record selezionati usando l'UID scelto."""
+        selected_items = self.tree.selection()
+        if not selected_items:
+            messagebox.showwarning(
+                "Attenzione",
+                "Seleziona almeno un record dalla tabella principale."
+            )
+            return
+
+        try:
+            new_owner_uid = int(str(owner_uid))
+            if new_owner_uid < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            messagebox.showerror(
+                "Errore owner",
+                f"UID owner non valido: {owner_uid}"
+            )
+            return
+
+        selected_records = []
+        for item_id in selected_items:
+            index = self.tree.index(item_id)
+            if index >= len(self.current_records):
+                continue
+            record = self.current_records[index]
+            rowid = int(record["_rowid"])
+            current_owner_uid = self.get_owner_uid_by_rowid(rowid)
+            if current_owner_uid is None or not str(current_owner_uid).isdigit():
+                self.log_message(
+                    f"[ERRORE] owner_uid non valido per rowid={rowid}: "
+                    f"{current_owner_uid}"
+                )
+                continue
+            selected_records.append((rowid, int(current_owner_uid)))
+
+        records_to_update = [
+            (rowid, current_uid)
+            for rowid, current_uid in selected_records
+            if current_uid != new_owner_uid
+        ]
+        if not records_to_update:
+            messagebox.showinfo(
+                "Nessuna modifica",
+                f"I record selezionati hanno già owner UID {new_owner_uid}."
+            )
+            return
+
+        changes = "\n".join(
+            f"- RowID {rowid}: UID {current_uid} -> {new_owner_uid}"
+            for rowid, current_uid in records_to_update
+        )
+        confirm = messagebox.askyesno(
+            "Conferma cambio owner",
+            f"Nuovo owner: {owner_name} (UID: {new_owner_uid})\n\n"
+            f"Record da aggiornare:\n{changes}\n\n"
+            "Il nuovo owner deve avere accesso ai percorsi condivisi. "
+            "In caso contrario Synology potrebbe mostrare il link come "
+            "\"Guasto\".\n\n"
+            "Prima della modifica verrà creato un backup verificato di "
+            "sharing.db.\n\n"
+            "Continuare?",
+            icon="warning"
+        )
+        if not confirm:
+            self.log_message("Cambio owner annullato dall'utente.")
+            return
+
+        backup_metadata = {
+            "operation": "owner_update",
+            "owner_name": owner_name,
+            "new_owner_uid": new_owner_uid,
+            "records": [
+                {
+                    "rowid": rowid,
+                    "previous_owner_uid": current_uid
+                }
+                for rowid, current_uid in records_to_update
+            ],
+            "retention_days": self.backup_retention_days
+        }
+        try:
+            backup_path = self.create_sharing_backup(backup_metadata)
+            self.log_message(f"[BACKUP] Creato backup verificato: {backup_path}")
+            self.log_message(
+                f"[BACKUP] Manifest associato: {backup_path[:-3]}json"
+            )
+            self.log_message(
+                f"[BACKUP] Retention automatica: {self.backup_retention_days} giorni"
+            )
+        except Exception as e:
+            messagebox.showerror(
+                "Backup non riuscito",
+                f"Il cambio owner è stato annullato.\n\n{e}"
+            )
+            self.log_message(f"[ERRORE] Backup sharing.db non riuscito: {e}")
+            return
+
+        selected_rowids = [rowid for rowid, _ in selected_records]
+        for rowid, current_owner_uid in records_to_update:
+            update_sql = (
+                "UPDATE entry "
+                f"SET owner_uid={new_owner_uid} "
+                f"WHERE id={rowid} AND owner_uid={current_owner_uid}; "
+                "SELECT changes();"
+            )
+            command = (
+                "sudo -S sqlite3 "
+                "/usr/syno/etc/private/session/sharing/sharing.db "
+                f"{shlex.quote(update_sql)}"
+            )
+            try:
+                result = self.run_ssh_command(command)
+                result_lines = [
+                    line.strip()
+                    for line in result.splitlines()
+                    if line.strip() and not line.strip().startswith("Password")
+                ]
+                changes_count = result_lines[-1] if result_lines else ""
+                if changes_count != "1":
+                    self.log_message(
+                        f"[ATTENZIONE] Nessuna modifica applicata a rowid={rowid}."
+                    )
+                    continue
+
+                verify_sql = (
+                    "SELECT owner_uid FROM entry "
+                    f"WHERE id={rowid};"
+                )
+                verify_command = (
+                    "sudo -S sqlite3 "
+                    "/usr/syno/etc/private/session/sharing/sharing.db "
+                    f"{shlex.quote(verify_sql)}"
+                )
+                verified_owner_uid = self.run_ssh_command(verify_command).strip()
+                if verified_owner_uid == str(new_owner_uid):
+                    self.log_message(
+                        f"[SUCCESSO] Owner aggiornato per rowid={rowid}: "
+                        f"{owner_name} (UID: {new_owner_uid})"
+                    )
+                else:
+                    self.log_message(
+                        f"[ATTENZIONE] Verifica owner fallita per rowid={rowid}: "
+                        f"letto {verified_owner_uid}"
+                    )
+            except Exception as e:
+                self.log_message(f"[ERRORE] Cambio owner rowid={rowid}: {e}")
+
+        self.search_files()
+        self.restore_selection_by_rowids(selected_rowids)
+        self.refresh_selected_info()
+
+    def list_backup_manifests(self):
+        """Legge i manifest dei backup owner dalla cartella configurata."""
+        command = (
+            "sudo -S find "
+            f"{shlex.quote(self.backup_directory)} "
+            "-maxdepth 1 -type f -name 'sharing.db.sslm-*.json' -print | sort -r"
+        )
+        result = self.run_ssh_command(command)
+        backups = []
+        for manifest_path in result.splitlines():
+            manifest_path = manifest_path.strip()
+            if not manifest_path:
+                continue
+            try:
+                manifest_command = (
+                    "sudo -S cat "
+                    f"{shlex.quote(manifest_path)}"
+                )
+                manifest = json.loads(self.run_ssh_command(manifest_command))
+                if manifest.get("operation") != "owner_update":
+                    continue
+                backups.append({
+                    "manifest_path": manifest_path,
+                    "backup_path": f"{manifest_path[:-5]}.db",
+                    "manifest": manifest
+                })
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                self.log_message(
+                    f"[ATTENZIONE] Manifest ignorato {manifest_path}: {e}"
+                )
+        return backups
+
+    def manage_backups(self):
+        """Mostra i backup owner e permette il ripristino mirato."""
+        try:
+            backups = self.list_backup_manifests()
+        except Exception as e:
+            messagebox.showerror(
+                "Errore backup",
+                f"Impossibile leggere la cartella backup:\n\n{e}"
+            )
+            self.log_message(f"[ERRORE] Lettura backup fallita: {e}")
+            return
+
+        popup = tb.Toplevel(self.root)
+        popup.title("Gestione Backup Owner")
+        popup.geometry("900x500")
+        popup.resizable(True, True)
+        popup.transient(self.root)
+        popup.grab_set()
+        self.set_window_icon(popup)
+
+        main_frame = tb.Frame(popup, padding=15)
+        main_frame.pack(fill=BOTH, expand=True)
+
+        tb.Label(
+            main_frame,
+            text=f"Backup in {self.backup_directory}",
+            bootstyle="dark"
+        ).pack(anchor="w", pady=(0, 10))
+
+        listbox = Listbox(main_frame, font=("Consolas", 9))
+        listbox.pack(fill=BOTH, expand=True, pady=5)
+
+        def format_backup(backup):
+            manifest = backup["manifest"]
+            records = manifest.get("records", [])
+            owner_name = manifest.get("owner_name", "N/A")
+            new_uid = manifest.get("new_owner_uid", "N/A")
+            file_name = os.path.basename(backup["backup_path"])
+            return (
+                f"{file_name} | nuovo owner: {owner_name} "
+                f"(UID {new_uid}) | record: {len(records)}"
+            )
+
+        def populate():
+            listbox.delete(0, tk.END)
+            for backup in backups:
+                listbox.insert(tk.END, format_backup(backup))
+            if not backups:
+                listbox.insert(tk.END, "Nessun backup owner disponibile")
+
+        populate()
+
+        def restore_selected():
+            selections = listbox.curselection()
+            if not selections or not backups:
+                messagebox.showwarning(
+                    "Attenzione",
+                    "Seleziona un backup da ripristinare."
+                )
+                return
+            selected_backup = backups[selections[0]]
+            popup.destroy()
+            self.restore_owner_backup(
+                selected_backup["manifest"],
+                selected_backup["manifest_path"]
+            )
+
+        btn_frame = tb.Frame(main_frame)
+        btn_frame.pack(fill=X, pady=(10, 0))
+        tb.Button(
+            btn_frame,
+            text="Ripristina Owner",
+            command=restore_selected,
+            bootstyle="warning",
+            width=18
+        ).pack(side=LEFT, padx=5)
+        tb.Button(
+            btn_frame,
+            text="Chiudi",
+            command=popup.destroy,
+            bootstyle="secondary",
+            width=10
+        ).pack(side=LEFT, padx=5)
+
+    def restore_owner_backup(self, manifest, manifest_path):
+        """Ripristina solo gli owner descritti da un manifest verificato."""
+        try:
+            new_owner_uid = int(manifest["new_owner_uid"])
+            manifest_records = manifest["records"]
+            records = [
+                (int(item["rowid"]), int(item["previous_owner_uid"]))
+                for item in manifest_records
+            ]
+            if not records:
+                raise ValueError("Il manifest non contiene record.")
+        except (KeyError, TypeError, ValueError) as e:
+            messagebox.showerror(
+                "Manifest non valido",
+                f"Impossibile usare il manifest selezionato:\n\n{e}"
+            )
+            return
+
+        record_summary = "\n".join(
+            f"- RowID {rowid}: UID {new_owner_uid} -> {previous_uid}"
+            for rowid, previous_uid in records
+        )
+        confirm = messagebox.askyesno(
+            "Conferma ripristino owner",
+            f"Manifest:\n{manifest_path}\n\n"
+            f"Il ripristino modificherà solo gli owner seguenti:\n"
+            f"{record_summary}\n\n"
+            "Ogni record verrà aggiornato solo se possiede ancora il nuovo "
+            "UID dell'operazione originale. Verrà creato un nuovo backup "
+            "prima del rollback.\n\n"
+            "Continuare?",
+            icon="warning"
+        )
+        if not confirm:
+            self.log_message("Ripristino owner annullato dall'utente.")
+            return
+
+        rollback_metadata = {
+            "operation": "owner_restore",
+            "source_manifest": manifest_path,
+            "records": [
+                {
+                    "rowid": rowid,
+                    "previous_owner_uid": new_owner_uid,
+                    "restored_owner_uid": previous_uid
+                }
+                for rowid, previous_uid in records
+            ],
+            "retention_days": self.backup_retention_days
+        }
+        try:
+            backup_path = self.create_sharing_backup(rollback_metadata)
+            self.log_message(
+                f"[BACKUP] Backup pre-ripristino creato: {backup_path}"
+            )
+        except Exception as e:
+            messagebox.showerror(
+                "Backup non riuscito",
+                f"Ripristino annullato:\n\n{e}"
+            )
+            self.log_message(
+                f"[ERRORE] Backup pre-ripristino non riuscito: {e}"
+            )
+            return
+
+        row_ids_sql = ",".join(str(rowid) for rowid, _ in records)
+        owner_cases_sql = " ".join(
+            f"WHEN {rowid} THEN {previous_uid}"
+            for rowid, previous_uid in records
+        )
+        verify_cases_sql = " ".join(
+            f"WHEN {rowid} THEN CASE WHEN owner_uid={previous_uid} "
+            "THEN 1 ELSE 0 END"
+            for rowid, previous_uid in records
+        )
+        record_count = len(records)
+        update_sql = (
+            "BEGIN TRANSACTION; "
+            "UPDATE entry "
+            "SET owner_uid=CASE id "
+            f"{owner_cases_sql} END "
+            f"WHERE id IN ({row_ids_sql}) "
+            f"AND owner_uid={new_owner_uid} "
+            f"AND (SELECT COUNT(*) FROM entry "
+            f"WHERE id IN ({row_ids_sql}) "
+            f"AND owner_uid={new_owner_uid})={record_count}; "
+            "SELECT changes(); "
+            "COMMIT;"
+        )
+        command = (
+            "sudo -S sqlite3 "
+            "/usr/syno/etc/private/session/sharing/sharing.db "
+            f"{shlex.quote(update_sql)}"
+        )
+        try:
+            result = self.run_ssh_command(command)
+            result_lines = [
+                line.strip()
+                for line in result.splitlines()
+                if line.strip() and not line.strip().startswith("Password")
+            ]
+            changes_count = result_lines[-1] if result_lines else ""
+            if changes_count != str(record_count):
+                self.log_message(
+                    "[SKIP] Ripristino annullato: almeno un record non ha "
+                    f"più owner UID {new_owner_uid}."
+                )
+                restored_rowids = []
+            else:
+                verify_sql = (
+                    "SELECT CASE WHEN COUNT(*)="
+                    f"{record_count} AND COALESCE(SUM(CASE id "
+                    f"{verify_cases_sql} ELSE 0 END), 0)="
+                    f"{record_count} "
+                    f"THEN 'ok' ELSE 'mismatch' END "
+                    f"FROM entry WHERE id IN ({row_ids_sql});"
+                )
+                verify_command = (
+                    "sudo -S sqlite3 "
+                    "/usr/syno/etc/private/session/sharing/sharing.db "
+                    f"{shlex.quote(verify_sql)}"
+                )
+                verification = self.run_ssh_command(verify_command).strip()
+                if verification != "ok":
+                    raise RuntimeError(
+                        f"Verifica owner fallita dopo il ripristino: {verification}"
+                    )
+                integrity_command = (
+                    "sudo -S sqlite3 "
+                    "/usr/syno/etc/private/session/sharing/sharing.db "
+                    "'PRAGMA integrity_check;'"
+                )
+                integrity = self.run_ssh_command(integrity_command).strip()
+                if integrity != "ok":
+                    raise RuntimeError(
+                        f"Integrità sharing.db non verificata: {integrity}"
+                    )
+                restored_rowids = [rowid for rowid, _ in records]
+                for rowid, previous_uid in records:
+                    self.log_message(
+                        f"[SUCCESSO] Owner ripristinato per rowid={rowid}: "
+                        f"UID {previous_uid}"
+                    )
+        except Exception as e:
+            self.log_message(f"[ERRORE] Ripristino owner transazionale: {e}")
+            restored_rowids = []
+
+        if restored_rowids:
+            self.search_files()
+            self.restore_selection_by_rowids(restored_rowids)
+            self.refresh_selected_info()
+            messagebox.showinfo(
+                "Ripristino completato",
+                f"Owner ripristinati: {len(restored_rowids)}.\n"
+                f"Backup pre-ripristino: {backup_path}"
+            )
+        else:
+            messagebox.showwarning(
+                "Nessun ripristino",
+                "Nessun record è stato ripristinato: gli owner attuali "
+                "non corrispondono al manifest."
+            )
 
     def get_public_url_by_rowid(self, rowid):
         """Recupera l'URL pubblico dato il rowid della condivisione."""
@@ -833,9 +1404,10 @@ class ModernSSLM:
         records = []
         for line in result.splitlines():
             try:
-                rowid, data = line.split("|", 1)
+                rowid, owner_uid, data = line.split("|", 2)
                 rec = json.loads(data)
                 rec["_rowid"] = int(rowid)
+                rec["_owner_uid"] = owner_uid.strip()
                 records.append(rec)
             except Exception:
                 pass
@@ -886,8 +1458,22 @@ class ModernSSLM:
                 else:
                     uid_names.append(f"{uid_str} (Sconosciuto)")
             uids = " || ".join(uid_names)
+
+            owner_uid = str(rec.get("_owner_uid", "")).strip()
+            owner_name = (
+                self.find_user_name_by_uid(owner_uid)
+                if owner_uid.isdigit()
+                else None
+            )
+            owner = owner_name or (
+                f"{owner_uid} (Sconosciuto)" if owner_uid else "N/A"
+            )
             
-            self.tree.insert("", "end", values=(rec["_rowid"], name, path, gids, uids))
+            self.tree.insert(
+                "",
+                "end",
+                values=(rec["_rowid"], owner, name, path, gids, uids)
+            )
 
         self.current_records = filtered
         self.status_var.set(f"Trovati {len(filtered)} record")
