@@ -4,4 +4,6 @@
     "username": "admin",
     "password": "your-password",
     "BASE_URL": "https://your-server.com/sharing/"
+    "backup_dir": "/var/services/homes/admin/sslm-backups",
+    "backup_retention_days": 7
 }
